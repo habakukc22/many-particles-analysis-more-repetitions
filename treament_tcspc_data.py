@@ -1,0 +1,191 @@
+import numpy as np
+from scipy.fft import fft, fftfreq
+import os
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+def process_npy_array(nparr):
+  """Return a list of arrays, where each array is the difference between the current and previous array in nparr. The first array is returned as is."""
+  data = []
+  num_points = 200
+  points_off = 2
+  
+  for idx in range(len(nparr)):
+    xs = np.array(nparr[idx][0])[:num_points]
+    ys = np.array(nparr[idx][1])[:num_points]
+    
+    if len(xs) != len(ys):
+      raise Exception(f"\nO tamanho de xs não é o mesmo de ys: (len(xs), len(ys)) = {len(xs), len(ys)}")
+    
+    if len(ys) < int(0.95*num_points) :
+      # Remove measures with less than 95% of num_point 
+      continue
+    
+    data.append(np.column_stack((
+      xs[points_off:-points_off], ys[points_off:-points_off]
+      )))
+
+  return data
+
+def extract_data_info_from_path(path: str, raw_data = False):
+  freq = int(path.split("_fg")[1].split("Hz")[0])
+  amp = float(path.split("Hz_")[1].split("V_")[0])
+  offset = float(path.split("V_")[1].split("offs")[0])
+  try:
+    if raw_data:
+      data = np.loadtxt(path) if ".txt" in path else np.load(path, allow_pickle=True)
+    else:
+      data = np.loadtxt(path) if ".txt" in path else process_npy_array(np.load(path, allow_pickle=True))
+    
+    return {
+      "freq": freq,
+      "amp": amp,
+      "offset": offset,
+      "data": data,
+    }
+  except Exception as e:
+    print(f"Error to load freq {freq}Hz file.\nThe file path is {path}\nException detail: {e}")
+
+def get_mean_and_variance(data):
+    """Get a PROCESSED DATA array and calculate the mean and variance of the ys values for each x value. The data array is expected to be a list of arrays, where each array has two columns: the first column contains the x values and the second column contains the y values. The function returns three arrays: the x values, the mean of the y values for each x value, and the variance of the y values for each x value."""
+    data = np.array(data)
+    xs = data[0,:,0]
+    mean = data[:,:,1].mean(axis=0)
+    variance = data[:,:,1].var(axis=0)
+
+    return (xs, mean, variance)
+
+def fetch_data_filenames(data_path: str) -> list[str]:
+    """Returns a list of all filenames in the given directory and its subdirectories."""
+    filenames_all = []
+
+    for root, dirs, files in os.walk(data_path):
+        for name in files:
+            full_path = os.path.join(root, name)
+            filenames_all.append(full_path.replace("\\", "/"))
+
+    return filenames_all
+
+def get_fft(time, curve):
+  sample_interval = max(time)/len(curve)/1e6  # seconds per sample
+
+  N = len(curve)
+  yf = fft(curve)
+  xf = fftfreq(N, sample_interval)
+  return xf, yf
+
+def get_xf_yf_fund(time, curve, fund_freq):
+  """Return the frequency and complex amplitude for the point of the FFT with largest modulus. \n
+  (time, curve) -> (xf_fund, yf_fund)"""
+  xf, yf = get_fft(time, curve)
+  mask = xf > 0
+  xf = xf[mask]
+  yf = yf[mask]
+  
+  idx_freq = np.argmin(np.abs(xf - fund_freq))
+
+  xf_fund, yf_fund = xf[idx_freq], yf[idx_freq]
+
+  return xf_fund, yf_fund
+
+def get_mean_amp_and_phase(phasors_list: list):
+    """Return mean modulus, mean phase and their errors for a list of complex numbers. \n
+    phasor_list -> (mean_amp, amp_error, mean_phase, phase_error)
+    """
+    phasors = np.array(phasors_list)
+    mean_phasor = phasors.mean()
+    mean_amp = np.abs(mean_phasor)
+    amp_error = ((np.abs(phasors)).std())/np.sqrt(len(phasors))
+    mean_phasor_phase = np.angle(mean_phasor)
+    phase_list = np.angle(phasors)
+    phase_deviations = phase_list - mean_phasor_phase
+    wrapped_deviations = (phase_deviations + np.pi) % (2 * np.pi) - np.pi
+    
+    return mean_amp, amp_error, mean_phasor_phase, (wrapped_deviations.std())/np.sqrt(len(wrapped_deviations))
+
+def get_fund_freq_and_amp(time, curve):
+    """Return the fundamental frequency and its complex amplitude (modulus and phase) for a given time-domain curve. \n
+    (time, curve) -> (fund_xf, fund_yf)
+    """
+    xf, yf = get_fft(time, curve)
+    # print(xf.shape, yf.shape)
+    mask = xf > 0
+    xf = xf[mask]
+    yf = yf[mask]
+    # print(yf)
+    idx_fund_freq = np.where(np.abs(yf) == np.abs(yf).max())[0][0] if len(np.where(np.abs(yf) == np.abs(yf).max())[0]) == 1 else None
+    fund_freq = xf[idx_fund_freq]
+    
+    if False:
+        return {
+            "fund_freq": fund_freq, 
+            "modulus": np.abs(yf[idx_fund_freq]), 
+            "phase": np.angle(yf[idx_fund_freq]),
+            }
+    
+    return (xf[idx_fund_freq], yf[idx_fund_freq])
+
+def plot_time_and_freq_domain(time, lum_curve, laser_curve):
+    """Plot time and frequency domain of the luminescence and laser curves"""
+    xf_laser, yf_laser = get_fft(time, laser_curve)
+    xf_lum, yf_lum = get_fft(time, lum_curve)
+    
+    #Filtering only positive frequencies
+    lum_mask = xf_lum > 0
+    xf_lum = xf_lum[lum_mask]
+    yf_lum = yf_lum[lum_mask]
+    laser_mask = xf_laser > 0
+    xf_laser = xf_laser[laser_mask]
+    yf_laser = yf_laser[laser_mask]
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 6), constrained_layout=True)
+
+    axs[0].plot(time*(1e-6), laser_curve/np.max(laser_curve), color="tab:red", label="laser")
+    axs[0].plot(time*(1e-6), lum_curve/np.max(lum_curve), color="tab:green", label="lum")
+    axs[0].legend()
+    axs[0].set_xlabel("Time ($\mu$s)")
+    axs[0].set_ylabel("Intensity (a.u.)")
+    axs[0].set_title("Time Domain")
+
+    axs[1].plot(xf_laser, np.abs(yf_laser)/np.abs(yf_laser).max(), color="tab:red", label="laser")
+    axs[1].plot(xf_lum, np.abs(yf_lum)/np.abs(yf_lum).max(), color="tab:green", label="lum")
+    axs[1].set_xlabel("Frequency (Hz)")
+    axs[1].set_ylabel("Amplitude")
+    axs[1].legend()
+    axs[1].set_title("Frequency Domain")
+    plt.show()
+
+def time_domain_visual_verification(particles: list, particles_off = [], show_mean = False):
+
+  for p_idx, p_dic in enumerate(particles):
+    if p_idx in particles_off: continue
+    print(f"\n{'='*50}")
+    print(f"  Processing particle {p_dic['p_label']}  ")
+    print(f"{'='*50}")
+    # Find the number of frequencies measured for each particle 
+    freq_list = sorted(set([dic["freq"] for dic in p_dic["p_data"]]))
+    cols = 4
+    rows = int(np.ceil(len(freq_list) / cols))
+
+    # ---- Subplots de verificação visual ----
+    fig, axs = plt.subplots(rows, cols, figsize=(12, 12), constrained_layout=True)
+    fig.suptitle(f"Particle {p_dic["p_label"]}", fontsize=14)
+
+    for index, step_data in enumerate(p_dic["p_data"]):
+      freq = step_data["freq"]
+      i, j = divmod(index, cols)
+
+      cmap = plt.get_cmap("coolwarm")
+      norm = mcolors.Normalize(vmin=0, vmax = (len(step_data["data"])))
+
+      ax = axs[i, j]
+      for idx_rep, rep in enumerate(step_data["data"]):
+        c_grad = cmap(norm(idx_rep))
+        ax.plot(rep[:,0], rep[:,1], color=c_grad)
+
+      if show_mean:
+        ax.plot(np.array(step_data["data"]).mean(axis=0)[:,0], np.array(step_data["data"]).mean(axis=0)[:,1], color="black", linestyle="--", label="mean")
+
+      ax.set_title(f"{freq} Hz")
+
+    plt.show()
