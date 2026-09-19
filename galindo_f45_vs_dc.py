@@ -1,113 +1,128 @@
 """
 f45 x DC — teste de efeitos de superficie no estilo da Fig. 6 de Galindo (2021).
+Versao 2.
 
-Uso: rode este script (ou cole o conteudo numa celula) DEPOIS da celula 15 do
-notebook, ou seja, depois de `get_error_bar(exc_data_npy, p_list)`.
-Ele espera encontrar em memoria:
-    p_list  -> lista de particulas, cada uma com:
-                 p["p_label"]    rotulo
-                 p["error_bar"]  array (n_freq, 3) = [freq, delta_phi, erro]
-                 p["p_data"]     lista de steps, cada step com step["data"]
-                                 = lista de medidas, cada medida array (n,2)
-                                 com coluna 0 = tempo, coluna 1 = contagens
+Rode depois da celula 15 do notebook (a que chama get_error_bar):
 
-Saida: dois ajustes e um grafico bilog de k45 = 2*pi*f45 contra o termo DC.
+    from galindo_f45_vs_dc import run
+    res = run(p_list)
+
+Mudancas em relacao a versao 1:
+  * DC calculado por step e so depois combinado entre steps, para que os steps
+    com nrep alto nao dominem a media.
+  * DC em contagens por bin (nao dividido pela largura do bin): com ~100 bins
+    por periodo e tempo de integracao fixo, essa grandeza ja e proporcional ao
+    brilho, independente da frequencia de modulacao.
+  * Steps de frequencia muito baixa excluidos do DC: em 1-3 Hz dois ciclos
+    duram mais que o tempo de integracao e o histograma sai incompleto.
+  * Diagnostico do DC contra a frequencia: se o DC nao for plano, o eixo
+    horizontal nao mede brilho.
+  * Incertezas dos ajustes reescalonadas pelo chi2 quando a dispersao entre
+    particulas domina (que e o caso).
+  * Spearman como teste principal, por nao depender das barras de erro.
+  * Tabela .csv por particula, para cruzar com os tamanhos do MEV depois.
+
+IMPORTANTE: antes de rodar, corrija o pipeline em treament_tcspc_data.py:
+    points_off = 0                                   # mantem 2 periodos inteiros
+    sample_interval = max(time)/(len(curve)-1)/1e6   # em get_fft
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import odr
+from scipy.stats import spearmanr
 
 # ----------------------------------------------------------------------
 # Configuracao
 # ----------------------------------------------------------------------
-PHI_TARGET = -np.pi / 4      # fase alvo para definir f45
-BACKGROUND = 0.0             # contagens de fundo por bin, medidas sem particula
-N_MC = 2000                  # sorteios Monte Carlo para a incerteza de f45
-DC_MODE = "counts"             # "rate": contagens/bin dividido pela largura do bin
-                             # "counts": media de contagens por bin
-FREQ_MAX_DC = None           # se quiser restringir o DC a freqs <= este valor
-SKIP_PARTICLES = []          # rotulos a excluir
+PHI_TARGET = -np.pi / 4      # fase alvo que define f45
+BACKGROUND = 0.0             # contagens de fundo por bin (medidas sem particula)
+N_MC = 3000                  # sorteios Monte Carlo para a incerteza de f45
+FREQ_MIN_DC = 5.0            # ignora steps abaixo disto no calculo do DC
+FREQ_MAX_DC = np.inf
+SKIP_PARTICLES = []
+CSV_OUT = "galindo_table.csv"
 RNG = np.random.default_rng(0)
 
 
 # ----------------------------------------------------------------------
-# 1. Termo DC de cada particula
+# 1. DC
 # ----------------------------------------------------------------------
-def particle_dc(p, mode=DC_MODE, background=BACKGROUND, freq_max=FREQ_MAX_DC):
-    """Media do sinal (bin zero da FFT) sobre repeticoes e frequencias.
-
-    Retorna (dc, erro_dc). O erro e o desvio padrao da media entre steps, que
-    tambem serve de diagnostico: o DC nao deveria depender da frequencia.
-    """
-    per_step = []
+def particle_dc_by_step(p, background=BACKGROUND):
+    """Retorna (freqs, dc_por_step): media de contagens por bin em cada step."""
+    freqs, dcs = [], []
     for step in p["p_data"]:
-        if freq_max is not None and step["freq"] > freq_max:
+        reps = [np.asarray(m[:, 1], dtype=float).mean() - background
+                for m in step["data"]]
+        if not reps:
             continue
-        for meas in step["data"]:
-            t = np.asarray(meas[:, 0], dtype=float)
-            counts = np.asarray(meas[:, 1], dtype=float) - background
-            if mode == "rate":
-                dt = np.median(np.diff(t))
-                per_step.append(counts.mean() / dt)
-            else:
-                per_step.append(counts.mean())
+        freqs.append(step["freq"])
+        dcs.append(np.mean(reps))
+    order = np.argsort(freqs)
+    return np.asarray(freqs)[order], np.asarray(dcs)[order]
 
-    per_step = np.asarray(per_step)
-    dc = per_step.mean()
-    err = per_step.std(ddof=1) / np.sqrt(len(per_step)) if len(per_step) > 1 else 0.0
-    return dc, err
+
+def particle_dc(p):
+    """DC combinado da particula: mediana entre steps, robusta a outliers.
+
+    O erro e o desvio padrao da media entre steps. Se a dispersao relativa for
+    grande, o DC depende da frequencia e o eixo horizontal nao e confiavel.
+    """
+    freqs, dcs = particle_dc_by_step(p)
+    m = (freqs >= FREQ_MIN_DC) & (freqs <= FREQ_MAX_DC)
+    vals = dcs[m]
+    if vals.size == 0:
+        return np.nan, np.nan, np.nan
+    dc = np.median(vals)
+    err = vals.std(ddof=1) / np.sqrt(vals.size) if vals.size > 1 else 0.0
+    spread = vals.std(ddof=1) / abs(dc) if vals.size > 1 and dc != 0 else np.nan
+    return dc, err, spread
 
 
 # ----------------------------------------------------------------------
-# 2. f45 de cada particula, sem modelo
+# 2. f45, sem modelo
 # ----------------------------------------------------------------------
 def _cross_f45(freq, phase, phi_target=PHI_TARGET):
-    """Interpola em log10(f) o primeiro cruzamento de phi_target.
-
-    So considera o trecho antes do minimo da fase, onde a curva e monotonica.
-    Retorna np.nan se nao houver cruzamento.
-    """
     i_min = int(np.argmin(phase))
-    f = freq[: i_min + 1]
-    ph = phase[: i_min + 1]
-
+    f, ph = freq[: i_min + 1], phase[: i_min + 1]
     below = np.where(ph <= phi_target)[0]
     if below.size == 0 or below[0] == 0:
         return np.nan
     j = below[0]
-
     x0, x1 = np.log10(f[j - 1]), np.log10(f[j])
     y0, y1 = ph[j - 1], ph[j]
     if y1 == y0:
         return np.nan
-    x = x0 + (phi_target - y0) * (x1 - x0) / (y1 - y0)
-    return 10.0 ** x
+    return 10.0 ** (x0 + (phi_target - y0) * (x1 - x0) / (y1 - y0))
 
 
-def particle_f45(p, n_mc=N_MC, phi_target=PHI_TARGET):
-    """f45 e sua incerteza, propagada por Monte Carlo sobre as barras de erro."""
+def particle_f45(p, n_mc=N_MC):
     arr = np.asarray(p["error_bar"], dtype=float)
-    order = np.argsort(arr[:, 0])
-    freq, phase, sigma = arr[order, 0], arr[order, 1], arr[order, 2]
+    o = np.argsort(arr[:, 0])
+    freq, phase, sigma = arr[o, 0], arr[o, 1], arr[o, 2]
 
-    f45 = _cross_f45(freq, phase, phi_target)
+    f45 = _cross_f45(freq, phase)
     if not np.isfinite(f45):
         return np.nan, np.nan
-
-    draws = np.empty(n_mc)
-    for i in range(n_mc):
-        draws[i] = _cross_f45(freq, phase + RNG.normal(0.0, sigma), phi_target)
+    draws = np.array([_cross_f45(freq, phase + RNG.normal(0.0, sigma))
+                      for _ in range(n_mc)])
     draws = draws[np.isfinite(draws)]
     err = draws.std(ddof=1) if draws.size > 10 else np.nan
     return f45, err
+
+
+def particle_shape(p):
+    """Duas grandezas extra sem modelo: minimo da fase e onde ele ocorre."""
+    arr = np.asarray(p["error_bar"], dtype=float)
+    i = int(np.argmin(arr[:, 1]))
+    return arr[i, 1], arr[i, 0]
 
 
 # ----------------------------------------------------------------------
 # 3. Coleta
 # ----------------------------------------------------------------------
 def collect(p_list, skip=SKIP_PARTICLES):
-    labels, dc, dc_e, f45, f45_e = [], [], [], [], []
+    rows = []
     for p in p_list:
         if p["p_label"] in skip:
             continue
@@ -115,114 +130,141 @@ def collect(p_list, skip=SKIP_PARTICLES):
         if not np.isfinite(f):
             print(f"Particula {p['p_label']}: sem cruzamento de -pi/4, descartada.")
             continue
-        d, de = particle_dc(p)
+        d, de, spread = particle_dc(p)
         if not np.isfinite(d) or d <= 0:
             print(f"Particula {p['p_label']}: DC invalido ({d}), descartada.")
             continue
-        labels.append(p["p_label"])
-        f45.append(f)
-        f45_e.append(fe if np.isfinite(fe) else 0.0)
-        dc.append(d)
-        dc_e.append(de)
-    return (np.array(labels), np.array(dc), np.array(dc_e),
-            np.array(f45), np.array(f45_e))
+        phmin, fmin = particle_shape(p)
+        rows.append((p["p_label"], d, de, spread, f, fe, phmin, fmin))
+    cols = list(zip(*rows))
+    keys = ["label", "dc", "dc_e", "dc_spread", "f45", "f45_e", "phi_min", "f_min"]
+    return {k: np.asarray(v, dtype=float) for k, v in zip(keys, cols)}
 
 
 # ----------------------------------------------------------------------
 # 4. Ajustes
 # ----------------------------------------------------------------------
 def fit_powerlaw(dc, dc_e, k, k_e):
-    """Reta em log-log: log10(k) = a + b*log10(I). Devolve b (expoente)."""
     x, y = np.log10(dc), np.log10(k)
-    sx = np.where(dc > 0, dc_e / (dc * np.log(10)), 0.0)
-    sy = np.where(k > 0, k_e / (k * np.log(10)), 0.0)
-    sx = np.where(sx > 0, sx, np.full_like(sx, 1e-6))
-    sy = np.where(sy > 0, sy, np.full_like(sy, 1e-6))
-
+    sx = np.maximum(dc_e / (dc * np.log(10)), 1e-9)
+    sy = np.maximum(k_e / (k * np.log(10)), 1e-9)
     model = odr.Model(lambda B, x: B[0] + B[1] * x)
-    data = odr.RealData(x, y, sx=sx, sy=sy)
-    out = odr.ODR(data, model, beta0=[np.median(y), -1 / 3]).run()
-    return out
+    return odr.ODR(odr.RealData(x, y, sx=sx, sy=sy), model,
+                   beta0=[np.median(y), -1 / 3]).run()
 
 
 def fit_bulk_plus_surface(dc, dc_e, k, k_e, expo=-1 / 3):
-    """k = k_bulk + A * I**expo, com o expoente fixo em -1/3."""
-    sx = np.where(dc_e > 0, dc_e, 1e-6)
-    sy = np.where(k_e > 0, k_e, 1e-6)
-    model = odr.Model(lambda B, x: B[0] + B[1] * x ** expo)
-    data = odr.RealData(dc, k, sx=sx, sy=sy)
-    A0 = (k.max() - k.min()) / (dc.min() ** expo - dc.max() ** expo + 1e-30)
-    out = odr.ODR(data, model, beta0=[max(k.min() * 0.5, 0.0), abs(A0)]).run()
-    return out
+    """Minimos quadrados comuns (fit_type=2): nao desloca o eixo x, o que
+    evita valores negativos de I dentro da potencia fracionaria."""
+    model = odr.Model(lambda B, x: B[0] + B[1] * np.abs(x) ** expo)
+    data = odr.RealData(dc, k, sy=np.maximum(k_e, 1e-9))
+    # chute inicial pela reta em I^expo
+    A0, k0 = np.polyfit(dc ** expo, k, 1)
+    job = odr.ODR(data, model, beta0=[k0, A0])
+    job.set_job(fit_type=2)
+    return job.run()
 
 
 # ----------------------------------------------------------------------
 # 5. Execucao
 # ----------------------------------------------------------------------
-def run(p_list):
-    labels, dc, dc_e, f45, f45_e = collect(p_list)
-    k = 2 * np.pi * f45
-    k_e = 2 * np.pi * f45_e
-    print(f"\n{len(labels)} particulas aproveitadas.")
-    print(f"Faixa de DC: {dc.min():.3g} a {dc.max():.3g} "
-          f"({np.log10(dc.max() / dc.min()):.2f} decadas)")
-    print(f"Faixa de f45: {f45.min():.4g} Hz a {f45.max():.4g} Hz")
+def run(p_list, save_csv=CSV_OUT):
+    r = collect(p_list)
+    dc, dc_e, f45, f45_e = r["dc"], r["dc_e"], r["f45"], r["f45_e"]
+    k, k_e = 2 * np.pi * f45, 2 * np.pi * f45_e
+    n = len(r["label"])
 
-    if len(labels) < 4:
-        print("Poucas particulas para ajustar.")
-        return None
+    print(f"\n{n} particulas aproveitadas.")
+    print(f"DC:  {dc.min():.4g} a {dc.max():.4g} "
+          f"({np.log10(dc.max()/dc.min()):.2f} decadas)")
+    print(f"f45: {f45.min():.4g} a {f45.max():.4g} Hz "
+          f"(dispersao {100*f45.std(ddof=1)/f45.mean():.0f}%)")
+    bad = r["label"][r["dc_spread"] > 0.2]
+    if bad.size:
+        print(f"ATENCAO: DC varia mais de 20% entre steps nas particulas "
+              f"{bad.astype(int)}. Veja o grafico de diagnostico.")
 
-    fit1 = fit_powerlaw(dc, dc_e, k, k_e)
-    b, sb = fit1.beta[1], fit1.sd_beta[1]
-    print("\n--- Ajuste 1: lei de potencia pura ---")
-    print(f"expoente b = {b:.3f} +/- {sb:.3f}   (esperado -0.333)")
-    print(f"desvio em relacao a -1/3: {(b + 1/3) / sb:.1f} sigma"
-          if sb > 0 else "")
-    print(f"chi2 reduzido = {fit1.res_var:.2f}")
+    # -- teste principal, sem modelo --
+    rho, pval = spearmanr(dc, f45)
+    print("\n--- Spearman (teste principal) ---")
+    print(f"rho = {rho:.3f}, p = {pval:.3f}")
+    sx, sy = np.log10(dc).std(ddof=1), np.log10(f45).std(ddof=1)
+    rho_lim = np.tanh(1.96 / np.sqrt(n - 3))
+    print(f"sensibilidade: so detectaria |inclinacao| > {rho_lim*sy/sx:.2f} "
+          f"(a superficie preveria 0.33)")
 
-    fit2 = fit_bulk_plus_surface(dc, dc_e, k, k_e)
-    kb, skb = fit2.beta[0], fit2.sd_beta[0]
-    print("\n--- Ajuste 2: k = k_bulk + A*I^(-1/3) ---")
-    print(f"k_bulk = {kb:.4g} +/- {skb:.4g} s^-1  "
-          f"(tau_bulk = {1/kb*1e3:.3g} ms)" if kb > 0 else
-          f"k_bulk = {kb:.4g} +/- {skb:.4g} s^-1")
-    print(f"A = {fit2.beta[1]:.4g} +/- {fit2.sd_beta[1]:.4g}")
-    print(f"chi2 reduzido = {fit2.res_var:.2f}")
+    if n >= 4:
+        fit1 = fit_powerlaw(dc, dc_e, k, k_e)
+        s1 = max(1.0, np.sqrt(fit1.res_var))
+        print(f"\n--- Ajuste 1: lei de potencia (erros x{s1:.0f} pelo chi2) ---")
+        print(f"b = {fit1.beta[1]:.3f} +/- {fit1.sd_beta[1]*s1:.3f}   "
+              "(esperado -0.333)")
 
-    # grafico
+        fit2 = fit_bulk_plus_surface(dc, dc_e, k, k_e)
+        s2 = max(1.0, np.sqrt(fit2.res_var))
+        print("\n--- Ajuste 2: k = k_bulk + A*I^(-1/3) ---")
+        print(f"k_bulk = {fit2.beta[0]:.4g} +/- {fit2.sd_beta[0]*s2:.4g} s^-1")
+        print(f"A      = {fit2.beta[1]:.4g}"
+              + ("   (NEGATIVO: o modelo nao se aplica)"
+                 if fit2.beta[1] < 0 else ""))
+    else:
+        fit1 = fit2 = None
+
+    _plot(r, k, k_e, fit1, fit2, rho, pval)
+    _plot_dc_diagnostic(p_list, r["label"])
+
+    if save_csv:
+        hdr = "label,dc,dc_e,dc_spread,f45,f45_e,phi_min,f_min"
+        np.savetxt(save_csv, np.column_stack([r[c] for c in hdr.split(",")]),
+                   delimiter=",", header=hdr, comments="", fmt="%.6g")
+        print(f"\nTabela salva em {save_csv} "
+              "(acrescente a coluna de raio quando tiver o MEV).")
+
+    r.update(k=k, k_e=k_e, fit_powerlaw=fit1, fit_bulk=fit2,
+             spearman=(rho, pval))
+    return r
+
+
+def _plot(r, k, k_e, fit1, fit2, rho, pval):
+    dc, dc_e = r["dc"], r["dc_e"]
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.errorbar(dc, k, xerr=dc_e, yerr=k_e, fmt="o", capsize=4,
-                color="tab:blue", label="particulas")
-    for lab, x, y in zip(labels, dc, k):
-        ax.annotate(str(lab), (x, y), fontsize=7,
+    ax.errorbar(dc, k, xerr=dc_e, yerr=k_e, fmt="o", capsize=4, color="tab:blue")
+    for lab, x, y in zip(r["label"], dc, k):
+        ax.annotate(str(int(lab)), (x, y), fontsize=7,
                     textcoords="offset points", xytext=(4, 4))
 
     xs = np.logspace(np.log10(dc.min()) - 0.1, np.log10(dc.max()) + 0.1, 200)
-    ax.plot(xs, 10 ** (fit1.beta[0] + fit1.beta[1] * np.log10(xs)),
-            "r-", label=f"lei de potencia, b = {b:.2f} +/- {sb:.2f}")
-    ax.plot(xs, fit2.beta[0] + fit2.beta[1] * xs ** (-1 / 3),
-            "g--", label="k_bulk + A I^(-1/3)")
-    if kb > 0:
-        ax.axhline(kb, color="gray", ls=":", lw=1, label="k_bulk")
+    if fit1 is not None:
+        ax.plot(xs, 10 ** (fit1.beta[0] + fit1.beta[1] * np.log10(xs)), "r-",
+                label=f"lei de potencia, b = {fit1.beta[1]:.2f}")
+    if fit2 is not None and fit2.beta[1] > 0:
+        ax.plot(xs, fit2.beta[0] + fit2.beta[1] * xs ** (-1 / 3), "g--",
+                label="k_bulk + A I^(-1/3)")
+    ax.plot(xs, np.median(k) * (xs / np.median(dc)) ** (-1 / 3), "k",
+            lw=0.8, alpha=0.5, label="inclinacao -1/3 (referencia)")
 
-    ref = np.median(k) * (xs / np.median(dc)) ** (-1 / 3)
-    ax.plot(xs, ref, color="k", lw=0.8, alpha=0.5, label="referencia -1/3")
-
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Termo DC da luminescencia (u.a.)")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("Termo DC da luminescencia (contagens/bin)")
     ax.set_ylabel(r"$k_{45} = 2\pi f_{45}$  (s$^{-1}$)")
-    ax.set_title("Teste de efeitos de superficie (estilo Galindo 2021)")
+    ax.set_title(f"Teste de superficie — Spearman rho={rho:.2f}, p={pval:.2f}")
     ax.legend(fontsize=8)
-    fig.tight_layout()
-    plt.show()
-
-    return dict(labels=labels, dc=dc, dc_e=dc_e, f45=f45, f45_e=f45_e,
-                fit_powerlaw=fit1, fit_bulk=fit2)
+    fig.tight_layout(); plt.show()
 
 
-if __name__ == "__main__":
-    try:
-        res = run(p_list)  # noqa: F821  (vem do notebook)
-    except NameError:
-        print("Rode este script no mesmo kernel do notebook, depois da celula 15.")
+def _plot_dc_diagnostic(p_list, labels):
+    """DC normalizado contra a frequencia. Deveria ser plano."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for p in p_list:
+        if p["p_label"] not in labels:
+            continue
+        f, d = particle_dc_by_step(p)
+        m = (f >= FREQ_MIN_DC) & (f <= FREQ_MAX_DC)
+        if m.sum() == 0 or np.median(d[m]) == 0:
+            continue
+        ax.plot(f[m], d[m] / np.median(d[m]), "-o", ms=3, alpha=0.6, lw=0.8)
+    ax.axhline(1.0, color="k", lw=1)
+    ax.set_xscale("log")
+    ax.set_xlabel("Frequencia do step (Hz)")
+    ax.set_ylabel("DC / mediana da particula")
+    ax.set_title("Diagnostico: o DC deveria ser plano em frequencia")
+    fig.tight_layout(); plt.show()
