@@ -24,7 +24,7 @@ from scipy import odr
 PHI_TARGET = -np.pi / 4      # fase alvo para definir f45
 BACKGROUND = 0.0             # contagens de fundo por bin, medidas sem particula
 N_MC = 2000                  # sorteios Monte Carlo para a incerteza de f45
-DC_MODE = "rate"             # "rate": contagens/bin dividido pela largura do bin
+DC_MODE = "counts"             # "rate": contagens/bin dividido pela largura do bin
                              # "counts": media de contagens por bin
 FREQ_MAX_DC = None           # se quiser restringir o DC a freqs <= este valor
 SKIP_PARTICLES = []          # rotulos a excluir
